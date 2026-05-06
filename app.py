@@ -14,11 +14,38 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────
+# AUTHENTICATION
+# ─────────────────────────────────────────────
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("📊 Marketing Data Manager")
+        st.divider()
+        pw = st.text_input("Enter password to continue", type="password")
+        if pw:
+            valid_passwords = st.secrets.get("passwords", {})
+            if pw in valid_passwords.values():
+                st.session_state.authenticated = True
+                # Store role based on which password was used
+                for role, role_pw in valid_passwords.items():
+                    if pw == role_pw:
+                        st.session_state.role = role
+                        break
+                st.rerun()
+            else:
+                st.error("Incorrect password")
+        st.stop()
+
+check_password()
+
+
+# ─────────────────────────────────────────────
 # DATABASE CONNECTION
 # ─────────────────────────────────────────────
 @st.cache_resource
 def get_engine():
-    """Create a cached database engine from Streamlit secrets."""
     creds = st.secrets["database"]
     url = (
         f"postgresql://{creds['user']}:{quote_plus(creds['password'])}"
@@ -28,7 +55,6 @@ def get_engine():
 
 
 def test_connection(engine):
-    """Test if the database connection is alive."""
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -40,8 +66,6 @@ def test_connection(engine):
 # ─────────────────────────────────────────────
 # COLUMN MAPPING CONFIGS
 # ─────────────────────────────────────────────
-# Maps Excel column names → PostgreSQL column names for each table
-
 COLUMN_MAP = {
     "marketing_mastersheet": {
         "Semester ID":          "semester_id",
@@ -95,18 +119,34 @@ COLUMN_MAP = {
     },
 }
 
-# Required columns for validation (subset that must not be missing)
 REQUIRED_COLUMNS = {
     "marketing_mastersheet": ["Semester ID", "Program ID", "Platform"],
     "leads_mastersheet":     ["Semester", "Date"],
     "enroll_mastersheet":    ["Semester", "Final Decision"],
 }
 
-# Dedup keys for each table (used for the REPLACE strategy)
+# Keys used to detect duplicates
 DEDUP_KEYS = {
     "marketing_mastersheet": ["semester_id", "program_id", "platform"],
-    "leads_mastersheet":     ["full_name", "email", "date", "semester", "program_id"],
-    "enroll_mastersheet":    ["full_name", "email_address", "created_date", "semester", "program_id"],
+    "leads_mastersheet":     ["email"],
+    "enroll_mastersheet":    ["email_address"],
+}
+
+# Available strategies per table
+STRATEGIES = {
+    "marketing_mastersheet": [
+        "Smart Append (detect & skip duplicates)",
+        "Replace (truncate & reload)",
+        "Upsert (update existing, insert new)",
+    ],
+    "leads_mastersheet": [
+        "Smart Append (detect & skip duplicates)",
+        "Replace (truncate & reload)",
+    ],
+    "enroll_mastersheet": [
+        "Smart Append (detect & skip duplicates)",
+        "Replace (truncate & reload)",
+    ],
 }
 
 
@@ -114,7 +154,6 @@ DEDUP_KEYS = {
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────
 def get_table_stats(engine):
-    """Fetch row counts and last updated for all 3 tables."""
     stats = {}
     for table in COLUMN_MAP.keys():
         try:
@@ -130,17 +169,14 @@ def get_table_stats(engine):
 
 
 def validate_file(df, table_name):
-    """Validate that uploaded file has the required columns."""
     errors = []
     required = REQUIRED_COLUMNS.get(table_name, [])
     expected = list(COLUMN_MAP[table_name].keys())
 
-    # Check required columns exist
     for col in required:
         if col not in df.columns:
             errors.append(f"Missing required column: **{col}**")
 
-    # Check for completely unexpected files
     matching = [c for c in df.columns if c in expected]
     match_pct = len(matching) / len(expected) * 100 if expected else 0
     if match_pct < 50:
@@ -153,17 +189,11 @@ def validate_file(df, table_name):
 
 
 def clean_and_map(df, table_name):
-    """Rename columns, clean whitespace, and prepare for DB insert."""
     col_map = COLUMN_MAP[table_name]
-
-    # Only keep columns that exist in the mapping
     cols_to_keep = [c for c in df.columns if c in col_map]
     df = df[cols_to_keep].copy()
-
-    # Rename to DB column names
     df = df.rename(columns=col_map)
 
-    # Strip whitespace from string columns
     for col in df.select_dtypes(include="object").columns:
         df[col] = df[col].astype(str).str.strip()
         df[col] = df[col].replace("nan", None)
@@ -173,45 +203,77 @@ def clean_and_map(df, table_name):
     return df
 
 
+# ─────────────────────────────────────────────
+# DUPLICATE DETECTION
+# ─────────────────────────────────────────────
+def detect_duplicates(df_new, table_name, engine):
+    keys = DEDUP_KEYS.get(table_name, [])
+    if not keys:
+        return df_new, pd.DataFrame(), 0
+
+    available_keys = [k for k in keys if k in df_new.columns]
+    if not available_keys:
+        return df_new, pd.DataFrame(), 0
+
+    key_cols_sql = ", ".join(available_keys)
+    try:
+        with engine.connect() as conn:
+            df_existing = pd.read_sql(
+                text(f"SELECT {key_cols_sql} FROM {table_name}"),
+                conn,
+            )
+            existing_count = len(df_existing)
+    except Exception:
+        return df_new, pd.DataFrame(), 0
+
+    if df_existing.empty:
+        return df_new, pd.DataFrame(), 0
+
+    def normalize(df, cols):
+        df = df.copy()
+        for col in cols:
+            if col in df.columns and df[col].dtype == "object":
+                df[col] = df[col].astype(str).str.strip().str.lower()
+            if col in df.columns and pd.api.types.is_datetime64_any_dtype(df[col]):
+                df[col] = df[col].astype(str)
+        return df
+
+    df_new_norm = normalize(df_new, available_keys)
+    df_existing_norm = normalize(df_existing, available_keys)
+
+    merged = df_new_norm.merge(
+        df_existing_norm.drop_duplicates(),
+        on=available_keys,
+        how="left",
+        indicator=True,
+    )
+
+    is_new = merged["_merge"] == "left_only"
+    df_new_only = df_new[is_new.values].reset_index(drop=True)
+    df_duplicates = df_new[~is_new.values].reset_index(drop=True)
+
+    return df_new_only, df_duplicates, existing_count
+
+
+# ─────────────────────────────────────────────
+# UPLOAD STRATEGIES
+# ─────────────────────────────────────────────
 def upload_replace(df, table_name, engine):
-    """
-    REPLACE strategy: truncate and reload the full table.
-    Safest approach for weekly full-file uploads.
-    """
     with engine.begin() as conn:
         conn.execute(text(f"TRUNCATE TABLE {table_name} RESTART IDENTITY"))
         df.to_sql(table_name, conn, if_exists="append", index=False)
     return len(df)
 
 
-def upload_append_dedup(df, table_name, engine):
-    """
-    APPEND strategy: insert new rows, then remove duplicates.
-    Better for incremental daily additions.
-    """
+def upload_new_only(df_new_only, table_name, engine):
+    if df_new_only.empty:
+        return 0
     with engine.begin() as conn:
-        df.to_sql(table_name, conn, if_exists="append", index=False)
-
-        # Remove duplicates based on dedup keys
-        keys = DEDUP_KEYS.get(table_name, [])
-        if keys:
-            key_conditions = " AND ".join([f"a.{k} = b.{k}" for k in keys])
-            # Keep the row with the lowest id (earliest insert)
-            dedup_sql = f"""
-                DELETE FROM {table_name} a
-                USING {table_name} b
-                WHERE a.id > b.id AND {key_conditions}
-            """
-            result = conn.execute(text(dedup_sql))
-            return len(df), result.rowcount  # rows inserted, dupes removed
-    return len(df), 0
+        df_new_only.to_sql(table_name, conn, if_exists="append", index=False)
+    return len(df_new_only)
 
 
 def upload_upsert_marketing(df, engine):
-    """
-    UPSERT strategy for marketing_mastersheet only.
-    Uses ON CONFLICT with the UNIQUE constraint.
-    """
     inserted = 0
     with engine.begin() as conn:
         for _, row in df.iterrows():
@@ -239,9 +301,13 @@ def upload_upsert_marketing(df, engine):
 with st.sidebar:
     st.title("📊 Marketing Data Manager")
     st.caption("Weekly data upload portal")
+    st.caption(f"Logged in as: **{st.session_state.get('role', 'unknown')}**")
+    if st.button("🚪 Logout"):
+        st.session_state.authenticated = False
+        st.session_state.role = None
+        st.rerun()
     st.divider()
 
-    # Connection status
     engine = get_engine()
     conn_status = test_connection(engine)
     if conn_status is True:
@@ -288,11 +354,12 @@ if page == "📈 Dashboard":
 
     st.divider()
 
-    # Quick KPI summary
     st.subheader("Quick KPIs")
     try:
         with engine.connect() as conn:
-            total_leads = conn.execute(text("SELECT COUNT(*) FROM leads_mastersheet")).scalar()
+            total_leads = conn.execute(
+                text("SELECT COUNT(*) FROM leads_mastersheet")
+            ).scalar()
             total_enrolled = conn.execute(
                 text("SELECT COUNT(*) FROM enroll_mastersheet WHERE final_decision = 'Enrolled'")
             ).scalar()
@@ -326,20 +393,21 @@ elif page == "📤 Upload Data":
         "enroll_mastersheet",
     ])
 
-    # Upload strategy
+    # Upload strategy — dynamic per table
+    available_strategies = STRATEGIES[table_name]
     strategy = st.radio(
         "Upload strategy",
-        ["Replace (truncate & reload)", "Append (add new, remove dupes)", "Upsert (marketing only)"],
+        available_strategies,
         help=(
-            "**Replace**: Deletes all existing rows and loads the full file. Safest for weekly full exports.\n\n"
-            "**Append**: Adds new rows, then removes exact duplicates. Good for incremental additions.\n\n"
-            "**Upsert**: Updates existing rows by key, inserts new ones. Only works for marketing_mastersheet."
+            "**Smart Append**: Scans for duplicates BEFORE uploading. "
+            "Shows you exactly which rows are new vs already in the database. "
+            "Only inserts new rows.\n\n"
+            "**Replace**: Deletes ALL existing rows and loads the full file. "
+            "Use for weekly full exports.\n\n"
+            "**Upsert** *(marketing only)*: Updates existing rows matched by "
+            "semester + program + platform. Inserts new ones."
         ),
     )
-
-    if strategy == "Upsert (marketing only)" and table_name != "marketing_mastersheet":
-        st.warning("Upsert is only available for `marketing_mastersheet` (it has a unique constraint). Choose a different strategy.")
-        st.stop()
 
     st.divider()
 
@@ -361,12 +429,12 @@ elif page == "📤 Upload Data":
             st.error(f"Could not read file: {e}")
             st.stop()
 
-        # Show raw preview
-        st.subheader("File Preview (raw)")
+        # File preview
+        st.subheader("📄 File Preview")
         st.dataframe(df_raw.head(10), use_container_width=True)
         st.caption(f"{len(df_raw):,} rows × {len(df_raw.columns)} columns")
 
-        # Validate
+        # Validate columns
         errors, matching, match_pct = validate_file(df_raw, table_name)
 
         if errors:
@@ -375,15 +443,15 @@ elif page == "📤 Upload Data":
                 st.write(f"- {err}")
             st.stop()
         else:
-            st.success(f"Validation passed — {match_pct:.0f}% columns matched ({len(matching)}/{len(COLUMN_MAP[table_name])})")
+            st.success(
+                f"Validation passed — {match_pct:.0f}% columns matched "
+                f"({len(matching)}/{len(COLUMN_MAP[table_name])})"
+            )
 
-        # Clean and map
+        # Clean and map columns
         df_clean = clean_and_map(df_raw, table_name)
 
-        st.subheader("Cleaned Preview (DB-ready)")
-        st.dataframe(df_clean.head(10), use_container_width=True)
-
-        # Column comparison
+        # Column mapping details
         with st.expander("Column mapping details"):
             mapping_data = []
             for excel_col, db_col in COLUMN_MAP[table_name].items():
@@ -393,39 +461,128 @@ elif page == "📤 Upload Data":
                     "DB Column": db_col,
                     "Found": found,
                 })
-            st.dataframe(pd.DataFrame(mapping_data), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(mapping_data),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         st.divider()
 
-        # Confirm upload
-        st.warning(
-            f"You are about to **{strategy.split('(')[0].strip().lower()}** "
-            f"**{len(df_clean):,}** rows into `{table_name}`."
-        )
+        # ───────────────────────────────────
+        # DUPLICATE ANALYSIS
+        # ───────────────────────────────────
+        st.subheader("🔍 Duplicate Analysis")
 
-        col_confirm, col_cancel = st.columns([1, 3])
-        with col_confirm:
-            confirm = st.button("✅ Confirm Upload", type="primary")
+        with st.spinner("Scanning database for duplicates..."):
+            df_new_only, df_duplicates, existing_count = detect_duplicates(
+                df_clean, table_name, engine
+            )
 
-        if confirm:
-            with st.spinner("Uploading to database..."):
-                try:
-                    if strategy.startswith("Replace"):
-                        count = upload_replace(df_clean, table_name, engine)
-                        st.success(f"Replaced table with **{count:,}** rows.")
+        # Show which key is used
+        keys = DEDUP_KEYS.get(table_name, [])
+        available_keys = [k for k in keys if k in df_clean.columns]
+        st.caption(f"Matching on: `{'` + `'.join(available_keys)}`")
 
-                    elif strategy.startswith("Append"):
-                        count, dupes = upload_append_dedup(df_clean, table_name, engine)
-                        st.success(f"Appended **{count:,}** rows, removed **{dupes:,}** duplicates.")
+        # Summary metrics
+        col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+        col_d1.metric("In Database", f"{existing_count:,}")
+        col_d2.metric("In Upload", f"{len(df_clean):,}")
+        col_d3.metric("🆕 New Rows", f"{len(df_new_only):,}")
+        col_d4.metric("🔁 Duplicates", f"{len(df_duplicates):,}")
 
-                    elif strategy.startswith("Upsert"):
+        # Visual bar
+        if len(df_clean) > 0:
+            new_pct = len(df_new_only) / len(df_clean) * 100
+            dup_pct = len(df_duplicates) / len(df_clean) * 100
+            st.progress(new_pct / 100)
+            st.caption(f"**{new_pct:.1f}%** new rows  ·  **{dup_pct:.1f}%** duplicates")
+
+        # Expandable duplicate details
+        if not df_duplicates.empty:
+            with st.expander(
+                f"👀 View {len(df_duplicates):,} duplicate rows (already in database)",
+                expanded=False,
+            ):
+                st.dataframe(df_duplicates, use_container_width=True, hide_index=True)
+
+        if not df_new_only.empty:
+            with st.expander(
+                f"🆕 View {len(df_new_only):,} new rows (will be inserted)",
+                expanded=False,
+            ):
+                st.dataframe(
+                    df_new_only.head(200),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if len(df_new_only) > 200:
+                    st.caption(f"Showing first 200 of {len(df_new_only):,} new rows")
+
+        st.divider()
+
+        # ───────────────────────────────────
+        # UPLOAD CONFIRMATION
+        # ───────────────────────────────────
+        if strategy.startswith("Smart Append"):
+            if df_new_only.empty:
+                st.info(
+                    "🟡 No new rows to upload — all rows in this file "
+                    "already exist in the database."
+                )
+            else:
+                st.warning(
+                    f"Ready to insert **{len(df_new_only):,}** new rows into "
+                    f"`{table_name}`. **{len(df_duplicates):,}** duplicates "
+                    f"will be skipped."
+                )
+                if st.button("✅ Upload New Rows Only", type="primary"):
+                    with st.spinner("Uploading new rows..."):
+                        try:
+                            count = upload_new_only(df_new_only, table_name, engine)
+                            st.success(
+                                f"Inserted **{count:,}** new rows. "
+                                f"Skipped **{len(df_duplicates):,}** duplicates."
+                            )
+                            st.balloons()
+                        except Exception as e:
+                            st.error(f"Upload failed: {e}")
+
+        elif strategy.startswith("Replace"):
+            st.warning(
+                f"⚠️ This will **DELETE all {existing_count:,} existing rows** "
+                f"and replace with **{len(df_clean):,}** rows from the file."
+            )
+            confirm_text = st.text_input(
+                f"Type **{table_name}** to confirm replacement:",
+                placeholder=table_name,
+            )
+            if st.button("🔄 Replace All Data", type="primary"):
+                if confirm_text == table_name:
+                    with st.spinner("Replacing table data..."):
+                        try:
+                            count = upload_replace(df_clean, table_name, engine)
+                            st.success(f"Replaced table with **{count:,}** rows.")
+                            st.balloons()
+                        except Exception as e:
+                            st.error(f"Upload failed: {e}")
+                else:
+                    st.error(f"Please type `{table_name}` exactly to confirm.")
+
+        elif strategy.startswith("Upsert"):
+            st.warning(
+                f"Will upsert **{len(df_clean):,}** rows into `{table_name}`. "
+                f"Existing rows (matched by semester + program + platform) "
+                f"will be updated. New rows will be inserted."
+            )
+            if st.button("✅ Upsert Data", type="primary"):
+                with st.spinner("Upserting rows..."):
+                    try:
                         count = upload_upsert_marketing(df_clean, engine)
                         st.success(f"Upserted **{count:,}** rows.")
-
-                    st.balloons()
-
-                except Exception as e:
-                    st.error(f"Upload failed: {e}")
+                        st.balloons()
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -445,23 +602,31 @@ elif page == "🔍 Browse Tables":
         col_a, col_b = st.columns(2)
 
         with col_a:
-            # Semester filter
             try:
-                sem_col = "semester_id" if table_name == "marketing_mastersheet" else "semester"
+                sem_col = (
+                    "semester_id"
+                    if table_name == "marketing_mastersheet"
+                    else "semester"
+                )
                 with engine.connect() as conn:
                     semesters = conn.execute(
-                        text(f"SELECT DISTINCT {sem_col} FROM {table_name} ORDER BY {sem_col}")
+                        text(
+                            f"SELECT DISTINCT {sem_col} FROM {table_name} "
+                            f"ORDER BY {sem_col}"
+                        )
                     ).scalars().all()
                 selected_sem = st.multiselect("Semester", semesters)
             except Exception:
                 selected_sem = []
 
         with col_b:
-            # Program filter
             try:
                 with engine.connect() as conn:
                     programs = conn.execute(
-                        text(f"SELECT DISTINCT program_id FROM {table_name} ORDER BY program_id")
+                        text(
+                            f"SELECT DISTINCT program_id FROM {table_name} "
+                            f"ORDER BY program_id"
+                        )
                     ).scalars().all()
                 selected_prog = st.multiselect("Program ID", programs)
             except Exception:
@@ -472,7 +637,11 @@ elif page == "🔍 Browse Tables":
     params = {}
 
     if selected_sem:
-        sem_col = "semester_id" if table_name == "marketing_mastersheet" else "semester"
+        sem_col = (
+            "semester_id"
+            if table_name == "marketing_mastersheet"
+            else "semester"
+        )
         query += f" AND {sem_col} = ANY(:semesters)"
         params["semesters"] = selected_sem
 
@@ -490,7 +659,6 @@ elif page == "🔍 Browse Tables":
         st.dataframe(df_browse, use_container_width=True, hide_index=True)
         st.caption(f"Showing {len(df_browse)} rows (max 500)")
 
-        # Download button
         csv = df_browse.to_csv(index=False)
         st.download_button(
             "📥 Download as CSV",
